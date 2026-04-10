@@ -1,3 +1,22 @@
+/*
+ * config.c - 配置文件解析实现
+ *
+ * 负责解析 sample.config 格式的配置文件，确定:
+ *   1. Server/Client 节点列表
+ *   2. 消息大小和并发度
+ *   3. 当前节点的角色 (Server/Client) 和 rank
+ *
+ * 配置文件示例:
+ *   servers:
+ *       server1 .. server2     (表示 server1, server2 两个节点)
+ *   clients:
+ *       client1 .. client2
+ *   num_concurr_msgs:
+ *       64                     (每个 QP 同时有 64 条消息在飞行)
+ *   msg_size:
+ *       8                      (每条消息 8 字节)
+ */
+
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
@@ -7,9 +26,10 @@
 #include "debug.h"
 #include "config.h"
 
+/* 全局配置实例 */
 struct ConfigInfo config_info;
 
-/* remove space, tab and line return from the line */
+/* 清除行中的空格、制表符和换行符 */
 void clean_up_line (char *line)
 {
     char *i = line;
@@ -26,13 +46,16 @@ void clean_up_line (char *line)
 }
 
 /*
- *  parse_node_list:
- *       get a list of servers or clients
+ * parse_node_list - 解析节点列表
  *
- *  return value:
- *       the number of nodes in the list
+ * 输入格式: "server1..server2" (清除空格后)
+ * 解析逻辑:
+ *   1) ".." 前的部分: 提取前缀名 + 起始编号 (如 "server" + 1)
+ *   2) ".." 后的部分: 提取结束编号 (如 2)
+ *   3) 生成节点名列表: server1, server2
+ *
+ * 返回: 节点数量
  */
-
 int parse_node_list (char *line, char ***node_list)
 {
     int start = 0, end = 0, num_nodes=0;
@@ -40,6 +63,7 @@ int parse_node_list (char *line, char ***node_list)
     char node_name_prefix[128] = {'\0'};
     char *j = node_name_prefix;
 
+    /* 解析 ".." 前的部分: 提取字母前缀和起始数字 */
     while (*i != '.') {
         if ((*i >= '0') && (*i <= '9')) {
             start = start * 10 + *i - '0';
@@ -50,7 +74,10 @@ int parse_node_list (char *line, char ***node_list)
         i += 1;
     }
 
+    /* 跳过 ".." */
     i += 2;
+
+    /* 解析 ".." 后的部分: 提取结束数字 */
     while (*i != 0) {
         if ((*i >= '0') && (*i <= '9')) {
             end = end * 10 + *i - '0';
@@ -61,12 +88,14 @@ int parse_node_list (char *line, char ***node_list)
     num_nodes = end - start + 1;
     check (num_nodes > 0, "Invaild number of nodes: %d", num_nodes);
 
+    /* 分配节点名数组 */
     *node_list = (char **) calloc (num_nodes, sizeof(char *));
     if (*node_list == NULL){
         printf ("Failed to allocate node_list.\n");
         return 0;
     }
 
+    /* 生成每个节点的主机名: 前缀 + 编号 */
     int k = 0, node_ind = start;
     
     for (k = 0; k < num_nodes; k++) {
@@ -89,6 +118,16 @@ int parse_node_list (char *line, char ***node_list)
     return -1;
 }
 
+/*
+ * get_rank - 根据 hostname 确定当前节点的角色和 rank
+ *
+ * 通过 uname() 获取本机 hostname，然后:
+ *   1) 在 Server 列表中查找: 找到则 is_server=true, rank=索引
+ *   2) 在 Client 列表中查找: 找到则 is_server=false, rank=索引
+ *   3) 都没找到: 报错退出
+ *
+ * 如果同一个 hostname 同时出现在 Server 和 Client 列表中，也报错。
+ */
 int get_rank ()
 {
     int			ret	    = 0;
@@ -98,13 +137,15 @@ int get_rank ()
     struct utsname	utsname_buf;
     char		hostname[64];
 
-    /* get hostname */
+    /* 获取本机 hostname */
     ret = uname (&utsname_buf);
     check (ret == 0, "Failed to call uname");
 
     strncpy (hostname, utsname_buf.nodename, sizeof(hostname));
 
     config_info.rank = -1;
+
+    /* 在 Server 列表中查找 */
     for (i = 0; i < num_servers; i++) {
         if (strstr(hostname, config_info.servers[i])) {
             config_info.rank      = i;
@@ -113,6 +154,7 @@ int get_rank ()
         }
     }
 
+    /* 在 Client 列表中查找 */
     for (i = 0; i < num_clients; i++) {
         if (strstr(hostname, config_info.clients[i])) {
             if (config_info.rank == -1) {
@@ -132,24 +174,36 @@ int get_rank ()
     return -1;
 }
 
+/*
+ * parse_config_file - 解析配置文件
+ *
+ * 使用简单的状态机解析:
+ *   1) 读取一行
+ *   2) 跳过注释行 (以 # 开头)
+ *   3) 识别属性标签 (servers: / clients: / msg_size: / num_concurr_msgs:)
+ *   4) 下一行读取对应的值
+ *   5) 最后调用 get_rank() 确定本节点身份
+ */
 int parse_config_file (char *fname)
 {
     int ret = 0;
     FILE *fp = NULL;
     char line[128] = {'\0'};
-    int  attr = 0;
+    int  attr = 0;      /* 当前正在解析的属性类型 */
 
     fp = fopen (fname, "r");
     check (fp != NULL, "Failed to open config file %s", fname);
 
     while (fgets(line, 128, fp) != NULL) {
-        // skip comments
+        /* 跳过注释行 */
         if (strstr(line, "#") != NULL) {
             continue;
         }
 
+        /* 移除空白字符 */
         clean_up_line (line);
 
+        /* 检测属性标签 */
 	if (strstr (line, "servers:")) {
             attr = ATTR_SERVERS;
             continue;
@@ -164,6 +218,7 @@ int parse_config_file (char *fname)
             continue;
         }
 
+        /* 根据当前属性类型解析值 */
 	if (attr == ATTR_SERVERS) {
             ret = parse_node_list (line, &config_info.servers);
             check (ret > 0, "Failed to get server list");
@@ -184,9 +239,10 @@ int parse_config_file (char *fname)
                    config_info.num_concurr_msgs);
         }
 
-        attr = 0;
+        attr = 0;  /* 重置状态 */
     }
 
+    /* 根据 hostname 判断当前节点角色和 rank */
     ret = get_rank ();
     check (ret == 0, "Failed to get rank");
 
@@ -201,6 +257,7 @@ int parse_config_file (char *fname)
     return -1;
 }
 
+/* 释放配置信息中动态分配的内存 */
 void destroy_config_info ()
 {
     int num_servers = config_info.num_servers;
@@ -226,6 +283,7 @@ void destroy_config_info ()
     }
 }
 
+/* 打印配置信息到日志 */
 void print_config_info ()
 {
     log (LOG_SUB_HEADER, "Configuraion");
